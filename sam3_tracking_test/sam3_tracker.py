@@ -47,7 +47,8 @@ def generate_kwcoco_manifest(
     text_prompt: str, 
     output_json: str, 
     conf_threshold: float = 0.50, 
-    mask_threshold: float = 0.0
+    mask_threshold: float = 0.0,
+    max_mem_frames: int = 30
 ) -> None:
     """
     Runs SAM3 natively on a video with a text prompt and serializes tracking data to KWCoco.
@@ -64,6 +65,9 @@ def generate_kwcoco_manifest(
         Confidence threshold for object presence. Defaults to 0.50.
     mask_threshold : float, optional
         Threshold for mask binarization (controls mask tightness). Defaults to 0.0.
+    max_mem_frames : int, optional
+        Maximum number of past frames to keep in the tracking memory bank. 
+        Limits VRAM usage on long, high-resolution videos. Defaults to 30.
 
     Returns
     -------
@@ -93,10 +97,14 @@ def generate_kwcoco_manifest(
     print("Loading SAM3 video predictor...")
     video_predictor = build_sam3_video_predictor()
     
-    # Start Session
-    print("Initializing SAM3 session...")
+    # Start Session with Memory Limit Configuration
+    print(f"Initializing SAM3 session (Memory Bank Limit: {max_mem_frames} frames)...")
     response = video_predictor.handle_request(
-        request=dict(type="start_session", resource_path=video_path)
+        request=dict(
+            type="start_session", 
+            resource_path=video_path,
+            max_obs_in_memory=max_mem_frames
+        )
     )
     session_id = response["session_id"]
     
@@ -168,6 +176,7 @@ if __name__ == "__main__":
     # Exposing tuning hyperparameters
     parser.add_argument("--conf", type=float, default=0.50, help="Confidence threshold for presence (0.0 to 1.0).")
     parser.add_argument("--mask-thresh", type=float, default=0.0, help="Mask binarization threshold (adjusts mask tightness/coarseness).")
+    parser.add_argument("--max-mem-frames", type=int, default=30, help="Maximum number of past frames to keep in the memory bank (prevents OOM on long videos).")
     
     args = parser.parse_args()
     
@@ -176,5 +185,6 @@ if __name__ == "__main__":
         text_prompt=args.prompt,
         output_json=args.output,
         conf_threshold=args.conf,
-        mask_threshold=args.mask_thresh
+        mask_threshold=args.mask_thresh,
+        max_mem_frames=args.max_mem_frames
     )
