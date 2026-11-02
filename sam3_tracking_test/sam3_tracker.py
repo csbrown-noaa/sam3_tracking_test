@@ -7,22 +7,20 @@ import kwimage
 import kwcoco
 from sam3.model_builder import build_sam3_video_predictor
 
-def extract_frames(video_path: str, out_dir: str) -> tuple[list[str], int, int]:
+def get_video_metadata(video_path: str) -> tuple[int, int, int]:
     """
-    Extracts frames from an MP4 video so KWCoco has tangible images to reference.
+    Reads the video header to extract metadata without decoding the pixels.
 
     Parameters
     ----------
     video_path : str
         Path to the input video file.
-    out_dir : str
-        Directory path where the extracted frames will be saved.
 
     Returns
     -------
-    tuple[list[str], int, int]
+    tuple[int, int, int]
         A tuple containing:
-        - list of str: Paths to the extracted frame images.
+        - int: Total number of frames in the video.
         - int: Width of the video frames.
         - int: Height of the video frames.
 
@@ -31,42 +29,28 @@ def extract_frames(video_path: str, out_dir: str) -> tuple[list[str], int, int]:
     ValueError
         If the video file cannot be opened.
     """
-    os.makedirs(out_dir, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
     
     if not cap.isOpened():
         raise ValueError(f"Could not open video file: {video_path}")
         
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    frames = []
-    idx = 0
-    print(f"Extracting frames from {video_path} to {out_dir}...")
-    while True:
-        ret, frame = cap.read()
-        if not ret: 
-            break
-        frame_name = f"frame_{idx:05d}.jpg"
-        frame_path = os.path.join(out_dir, frame_name)
-        cv2.imwrite(frame_path, frame)
-        frames.append(frame_path)
-        idx += 1
         
     cap.release()
-    print(f"Extracted {len(frames)} frames.")
-    return frames, w, h
+    print(f"Video metadata loaded: {total_frames} frames, {w}x{h} resolution.")
+    return total_frames, w, h
 
 def generate_kwcoco_manifest(
     video_path: str, 
     text_prompt: str, 
     output_json: str, 
-    frames_dir: str, 
     conf_threshold: float = 0.50, 
     mask_threshold: float = 0.0
 ) -> None:
     """
-    Runs SAM3 on a video with a text prompt and serializes the tracking data to KWCoco.
+    Runs SAM3 natively on a video with a text prompt and serializes tracking data to KWCoco.
 
     Parameters
     ----------
@@ -76,8 +60,6 @@ def generate_kwcoco_manifest(
         The object category to search for and track (e.g., 'car').
     output_json : str
         Path to the output KWCoco JSON manifest file.
-    frames_dir : str
-        Directory to store the extracted frames.
     conf_threshold : float, optional
         Confidence threshold for object presence. Defaults to 0.50.
     mask_threshold : float, optional
@@ -87,19 +69,19 @@ def generate_kwcoco_manifest(
     -------
     None
     """
-    # 1. Prepare video frames
-    frame_paths, w, h = extract_frames(video_path, frames_dir)
+    # 1. Fetch metadata (no frame extraction!)
+    total_frames, w, h = get_video_metadata(video_path)
     
     # 2. Initialize KWCoco Dataset
     dset = kwcoco.CocoDataset()
     cat_id = dset.add_category(name=text_prompt)
     vid_id = dset.add_video(name=os.path.basename(video_path))
     
-    # Pre-register all frames
+    # Pre-register all virtual frames (linking to the video, no file_name needed)
     img_ids = {}
-    for i, fpath in enumerate(frame_paths):
+    for i in range(total_frames):
         img_id = dset.add_image(
-            file_name=fpath, 
+            name=f"frame_{i:05d}", # Logical name instead of a file path
             video_id=vid_id, 
             frame_index=i, 
             width=w, 
@@ -133,11 +115,18 @@ def generate_kwcoco_manifest(
     )
     
     # 4. Propagate masks and serialize
-    print("Propagating masks through the video...")
+    print("Propagating masks natively through the video stream...")
     for response in video_predictor.handle_stream_request(
         request=dict(type="propagate_in_video", session_id=session_id)
     ):
         frame_idx = response["frame_index"]
+        
+        # Ensure we have a registered virtual image (in case video header count was slightly off)
+        if frame_idx not in img_ids:
+            img_ids[frame_idx] = dset.add_image(
+                name=f"frame_{frame_idx:05d}", video_id=vid_id, frame_index=frame_idx, width=w, height=h
+            )
+            
         current_img_id = img_ids[frame_idx]
         
         outputs = response["outputs"]
@@ -172,11 +161,10 @@ def generate_kwcoco_manifest(
     print("Serialization complete.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run SAM3 and export tracking data to KWCoco format.")
+    parser = argparse.ArgumentParser(description="Run SAM3 natively on a video and export tracking data to KWCoco format.")
     parser.add_argument("--video", type=str, required=True, help="Path to the input MP4 video.")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt for the object to track.")
     parser.add_argument("--output", type=str, default="tracking_output.kwcoco.json", help="Path for the output KWCoco JSON file.")
-    parser.add_argument("--frames-dir", type=str, default="extracted_frames", help="Directory to store extracted frames.")
     
     # Exposing tuning hyperparameters
     parser.add_argument("--conf", type=float, default=0.50, help="Confidence threshold for presence (0.0 to 1.0).")
@@ -188,7 +176,6 @@ if __name__ == "__main__":
         video_path=args.video,
         text_prompt=args.prompt,
         output_json=args.output,
-        frames_dir=args.frames_dir,
         conf_threshold=args.conf,
         mask_threshold=args.mask_thresh
     )
