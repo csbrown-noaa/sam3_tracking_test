@@ -90,11 +90,8 @@ def generate_kwcoco_manifest(
         img_ids[i] = img_id
 
     # 3. Load SAM3 with exposed hyperparameters
-    print(f"Loading SAM3 video predictor (conf={conf_threshold}, mask_thresh={mask_threshold})...")
-    video_predictor = build_sam3_video_predictor(
-        conf=conf_threshold,
-        mask_threshold=mask_threshold
-    )
+    print("Loading SAM3 video predictor...")
+    video_predictor = build_sam3_video_predictor()
     
     # Start Session
     print("Initializing SAM3 session...")
@@ -104,13 +101,15 @@ def generate_kwcoco_manifest(
     session_id = response["session_id"]
     
     # Add prompt to the first frame
-    print(f"Adding text prompt: '{text_prompt}' to frame 0...")
+    print(f"Adding text prompt: '{text_prompt}' to frame 0 (conf={conf_threshold}, mask_thresh={mask_threshold})...")
     video_predictor.handle_request(
         request=dict(
             type="add_prompt", 
             session_id=session_id, 
             frame_index=0, 
-            text=text_prompt
+            text=text_prompt,
+            conf=conf_threshold,
+            mask_threshold=mask_threshold
         )
     )
     
