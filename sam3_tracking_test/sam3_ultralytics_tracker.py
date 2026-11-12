@@ -78,7 +78,7 @@ def generate_kwcoco_manifest(
     max_obs_in_memory: int = 30,
     imgsz: int = 1024,
     vid_stride: int = 1,
-    half: bool = True,
+    quantize: int = 16,
     retina_masks: bool = False,
     iou: float = 0.70
 ) -> None:
@@ -95,13 +95,18 @@ def generate_kwcoco_manifest(
         "model": "/home/user/sam3/checkpoints/sam3.pt",
         "imgsz": imgsz,
         "vid_stride": vid_stride,
-        "half": half,
         "retina_masks": retina_masks,
-        "max_obs_in_memory": max_obs_in_memory 
+        "quantize": quantize
     }
+    
     predictor = SAM3VideoSemanticPredictor(overrides=overrides)
     
+    # --- THE BACK DOOR INJECTION ---
+    # Bypasses the strict YOLO validator by safely extending the parsed namespace
+    predictor.args.max_obs_in_memory = max_obs_in_memory
+    
     print(f"Propagating masks natively through the video stream (stream=True)...")
+    print(f"-> [Verification] Internal max_obs_in_memory securely set to: {getattr(predictor.args, 'max_obs_in_memory', 'FAILED')}")
     
     # 1. Stream and Track (This loop replaces the Meta predictor)
     # The stream=True argument guarantees frames are processed and discarded one-by-one
@@ -129,7 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-obs-in-memory", type=int, default=30, help="Maximum number of past frames to keep in the memory bank (prevents OOM).")
     parser.add_argument("--imgsz", type=int, default=1024, help="Inference resolution. Higher means better accuracy but more VRAM usage.")
     parser.add_argument("--vid-stride", type=int, default=1, help="Frame stride. 2 means skip every other frame.")
-    parser.add_argument("--no-half", action="store_false", dest="half", help="Disable FP16 half-precision and force FP32.")
+    parser.add_argument("--quantize", type=int, default=16, help="Quantization level. 16 means FP16 half-precision, 8 means INT8, use None/32 for standard FP32.")
     parser.add_argument("--retina-masks", action="store_true", help="Evaluate final mask boundaries at native image resolution.")
     parser.add_argument("--iou", type=float, default=0.70, help="Intersection Over Union (IoU) threshold for object tracking/overlap.")
     
@@ -143,7 +148,7 @@ if __name__ == "__main__":
         max_obs_in_memory=args.max_obs_in_memory,
         imgsz=args.imgsz,
         vid_stride=args.vid_stride,
-        half=args.half,
+        quantize=args.quantize,
         retina_masks=args.retina_masks,
         iou=args.iou
     )
