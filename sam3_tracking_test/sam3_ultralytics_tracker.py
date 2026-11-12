@@ -1,148 +1,149 @@
 import os
 import argparse
 import numpy as np
-import cv2
 import kwimage
 import kwcoco
 from ultralytics.models.sam import SAM3VideoSemanticPredictor
 
-def get_video_metadata(video_path: str) -> tuple[int, int, int]:
+def ultralytics_tracker_to_kwcoco(results, source: str, category_name: str, output_path: str) -> None:
     """
-    Reads the video header to extract metadata without decoding the pixels.
+    Consumes a lazy stream of Ultralytics tracking results and serializes them to KWCoco.
+    Supports both segmentation-based trackers (masks) and bounding-box-only trackers.
     """
-    cap = cv2.VideoCapture(video_path)
-    
-    if not cap.isOpened():
-        raise ValueError(f"Could not open video file: {video_path}")
-        
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-    cap.release()
-    print(f"Video metadata loaded: {total_frames} frames, {w}x{h} resolution.")
-    return total_frames, w, h
-
-def generate_kwcoco_manifest(
-    video_path: str, 
-    text_prompt: str, 
-    output_json: str, 
-    conf_threshold: float = 0.50, 
-    mask_threshold: float = 0.0,
-    max_mem_frames: int = 30
-) -> None:
-    """
-    Runs Ultralytics SAM on a video stream and serializes tracking data to KWCoco.
-    """
-    # 1. Fetch metadata
-    total_frames, w, h = get_video_metadata(video_path)
-    
-    # 2. Initialize KWCoco Dataset
     dset = kwcoco.CocoDataset()
-    cat_id = dset.add_category(name=text_prompt)
-    vid_id = dset.add_video(name=os.path.basename(video_path))
+    cat_id = dset.add_category(name=category_name)
+    vid_id = dset.add_video(name=os.path.basename(source))
     
-    # Pre-register all virtual frames
-    img_ids = {}
-    for i in range(total_frames):
+    # Process the lazy generator frame-by-frame
+    for frame_idx, result in enumerate(results):
+        # Dynamically fetch resolution from the first result (result.orig_shape is (h, w))
+        h, w = result.orig_shape
+        
+        # Register the frame on the fly
         img_id = dset.add_image(
-            name=f"frame_{i:05d}",
+            name=f"frame_{frame_idx:05d}",
             video_id=vid_id, 
-            frame_index=i, 
+            frame_index=frame_idx, 
             width=w, 
             height=h
         )
-        img_ids[i] = img_id
-
-    # 3. Load Ultralytics SAM Engine
-    print("Loading Ultralytics SAM3VideoSemanticPredictor engine...")
-    
-    overrides = {
-        "conf": conf_threshold,
-        "task": "segment",
-        "mode": "predict",
-        "model": "/home/user/sam3/checkpoints/sam3.pt",
-        "imgsz": 1024,
-        "half": True 
-    }
-    predictor = SAM3VideoSemanticPredictor(overrides=overrides)
-    
-    print(f"Propagating masks natively through the video stream (stream=True)...")
-    
-    # 4. Stream and Track (This loop replaces the Meta predictor)
-    # The stream=True argument guarantees frames are processed and discarded one-by-one
-    results = predictor(
-        source=video_path,
-        text=[text_prompt],
-        stream=True
-    )
-    
-    for frame_idx, result in enumerate(results):
-        
-        # Ensure we have a registered virtual image
-        if frame_idx not in img_ids:
-            img_ids[frame_idx] = dset.add_image(
-                name=f"frame_{frame_idx:05d}", video_id=vid_id, frame_index=frame_idx, width=w, height=h
-            )
-            
-        current_img_id = img_ids[frame_idx]
         
         # Check if the model found any objects in this frame
-        if result.masks is not None and result.boxes is not None:
-            # Extract PyTorch tensors to CPU NumPy arrays
-            masks_np = result.masks.data.cpu().numpy().astype(np.uint8)
+        if result.boxes is not None and len(result.boxes) > 0:
             boxes_np = result.boxes.xyxy.cpu().numpy()
             
-            # SAM3VideoSemanticPredictor tracks instances natively. 
-            # Fallback to sequential index if the Ultralytics YOLO ID field isn't populated
+            # Fetch tracking IDs (fallback to sequential if missing)
             if result.boxes.id is not None:
                 track_ids = result.boxes.id.int().cpu().tolist()
             else:
-                track_ids = list(range(len(masks_np)))
+                track_ids = list(range(len(boxes_np)))
+                
+            # Check if masks exist (SAM vs YOLO bounding-box trackers)
+            has_masks = result.masks is not None
+            if has_masks:
+                masks_np = result.masks.data.cpu().numpy().astype(np.uint8)
             
-            for mask_arr, bbox, track_id in zip(masks_np, boxes_np, track_ids):
-                # Wrap in KWImage Mask object
-                kw_mask = kwimage.Mask(mask_arr, 'c_mask')
+            for i in range(len(boxes_np)):
+                bbox = boxes_np[i]
+                track_id = track_ids[i]
                 
-                # Convert to compressed COCO RLE format
-                coco_rle = kw_mask.to_coco(style='rle')
-                
-                # Use the bounding box directly from the Ultralytics tracker
-                # Format is [x_min, y_min, width, height] for COCO. Ensure they are native floats for JSON.
+                # Format is [x_min, y_min, width, height] for COCO. Ensure they are native floats.
                 x1, y1, x2, y2 = map(float, bbox)
                 coco_bbox = [x1, y1, x2 - x1, y2 - y1]
                 
+                coco_rle = None
+                if has_masks:
+                    mask_arr = masks_np[i]
+                    kw_mask = kwimage.Mask(mask_arr, 'c_mask')
+                    coco_rle = kw_mask.to_coco(style='rle')
+                
                 # Add annotation to manifest
                 dset.add_annotation(
-                    image_id=current_img_id,
+                    image_id=img_id,
                     category_id=cat_id,
                     bbox=coco_bbox,
                     segmentation=coco_rle,
                     track_id=track_id
                 )
 
-    # 5. Save the dataset
-    print(f"Dumping completed KWCoco dataset to {output_json}...")
-    dset.dump(output_json, newlines=True)
+    print(f"Dumping completed KWCoco dataset to {output_path}...")
+    dset.dump(output_path, newlines=True)
     print("Serialization complete.")
+
+def generate_kwcoco_manifest(
+    source: str, 
+    text: str, 
+    output: str, 
+    conf: float = 0.50, 
+    max_obs_in_memory: int = 30,
+    imgsz: int = 1024,
+    vid_stride: int = 1,
+    half: bool = True,
+    retina_masks: bool = False,
+    iou: float = 0.70
+) -> None:
+    """
+    Runs Ultralytics SAM on a video stream and serializes tracking data to KWCoco.
+    """
+    print("Loading Ultralytics SAM3VideoSemanticPredictor engine...")
+    
+    overrides = {
+        "conf": conf,
+        "iou": iou,
+        "task": "segment",
+        "mode": "predict",
+        "model": "/home/user/sam3/checkpoints/sam3.pt",
+        "imgsz": imgsz,
+        "vid_stride": vid_stride,
+        "half": half,
+        "retina_masks": retina_masks,
+        "max_obs_in_memory": max_obs_in_memory 
+    }
+    predictor = SAM3VideoSemanticPredictor(overrides=overrides)
+    
+    print(f"Propagating masks natively through the video stream (stream=True)...")
+    
+    # 1. Stream and Track (This loop replaces the Meta predictor)
+    # The stream=True argument guarantees frames are processed and discarded one-by-one
+    results = predictor(
+        source=source,
+        text=[text],
+        stream=True
+    )
+    
+    # 2. Pass the lazy generator to the serializer
+    ultralytics_tracker_to_kwcoco(
+        results=results,
+        source=source,
+        category_name=text,
+        output_path=output
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Ultralytics SAM natively on a video and export tracking data to KWCoco format.")
-    parser.add_argument("--video", type=str, required=True, help="Path to the input MP4 video.")
-    parser.add_argument("--prompt", type=str, required=True, help="Text prompt for the object to track.")
+    parser.add_argument("--source", type=str, required=True, help="Path to the input MP4 video (Ultralytics 'source').")
+    parser.add_argument("--text", type=str, required=True, help="Text prompt for the object to track (Ultralytics 'text').")
     parser.add_argument("--output", type=str, default="tracking_output.kwcoco.json", help="Path for the output KWCoco JSON file.")
     
     parser.add_argument("--conf", type=float, default=0.50, help="Confidence threshold for presence (0.0 to 1.0).")
-    parser.add_argument("--mask-thresh", type=float, default=0.0, help="Mask binarization threshold (adjusts mask tightness/coarseness).")
-    parser.add_argument("--max-mem-frames", type=int, default=30, help="(Legacy arg) Unused by Ultralytics, handled internally.")
+    parser.add_argument("--max-obs-in-memory", type=int, default=30, help="Maximum number of past frames to keep in the memory bank (prevents OOM).")
+    parser.add_argument("--imgsz", type=int, default=1024, help="Inference resolution. Higher means better accuracy but more VRAM usage.")
+    parser.add_argument("--vid-stride", type=int, default=1, help="Frame stride. 2 means skip every other frame.")
+    parser.add_argument("--no-half", action="store_false", dest="half", help="Disable FP16 half-precision and force FP32.")
+    parser.add_argument("--retina-masks", action="store_true", help="Evaluate final mask boundaries at native image resolution.")
+    parser.add_argument("--iou", type=float, default=0.70, help="Intersection Over Union (IoU) threshold for object tracking/overlap.")
     
     args = parser.parse_args()
     
     generate_kwcoco_manifest(
-        video_path=args.video,
-        text_prompt=args.prompt,
-        output_json=args.output,
-        conf_threshold=args.conf,
-        mask_threshold=args.mask_thresh,
-        max_mem_frames=args.max_mem_frames
+        source=args.source,
+        text=args.text,
+        output=args.output,
+        conf=args.conf,
+        max_obs_in_memory=args.max_obs_in_memory,
+        imgsz=args.imgsz,
+        vid_stride=args.vid_stride,
+        half=args.half,
+        retina_masks=args.retina_masks,
+        iou=args.iou
     )
