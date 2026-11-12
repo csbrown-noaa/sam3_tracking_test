@@ -6,6 +6,8 @@ import numpy as np
 import kwimage
 import kwcoco
 from sam3.model_builder import build_sam3_video_predictor
+import tempfile
+from tqdm import tqdm
 
 def get_video_metadata(video_path: str) -> tuple[int, int, int]:
     """
@@ -93,74 +95,85 @@ def generate_kwcoco_manifest(
         )
         img_ids[i] = img_id
 
-    # 3. Load SAM3 with exposed hyperparameters
-    print("Loading SAM3 video predictor...")
-    video_predictor = build_sam3_video_predictor()
-    
-    # Start Session with Memory Limit Configuration
-    print(f"Initializing SAM3 session (Memory Bank Limit: {max_mem_frames} frames)...")
-    response = video_predictor.handle_request(
-        request=dict(
-            type="start_session", 
-            resource_path=video_path,
-            max_obs_in_memory=max_mem_frames
-        )
-    )
-    session_id = response["session_id"]
-    
-    # Add prompt to the first frame
-    print(f"Adding text prompt: '{text_prompt}' to frame 0 (conf={conf_threshold}, mask_thresh={mask_threshold})...")
-    video_predictor.handle_request(
-        request=dict(
-            type="add_prompt", 
-            session_id=session_id, 
-            frame_index=0, 
-            text=text_prompt,
-            conf=conf_threshold,
-            mask_threshold=mask_threshold
-        )
-    )
-    
-    # 4. Propagate masks and serialize
-    print("Propagating masks natively through the video stream...")
-    for response in video_predictor.handle_stream_request(
-        request=dict(type="propagate_in_video", session_id=session_id)
-    ):
-        frame_idx = response["frame_index"]
+    # Create temporary directory to force lazy-loading of JPEGs
+    print(f"Extracting {total_frames} frames to temporary directory for lazy-loading...")
+    with tempfile.TemporaryDirectory(prefix="sam3_frames_") as temp_dir:
+        cap = cv2.VideoCapture(video_path)
+        for i in tqdm(range(total_frames), desc="Extracting JPEGs"):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            cv2.imwrite(os.path.join(temp_dir, f"{i:05d}.jpg"), frame)
+        cap.release()
+
+        # 3. Load SAM3 with exposed hyperparameters
+        print("Loading SAM3 video predictor...")
+        video_predictor = build_sam3_video_predictor()
         
-        # Ensure we have a registered virtual image (in case video header count was slightly off)
-        if frame_idx not in img_ids:
-            img_ids[frame_idx] = dset.add_image(
-                name=f"frame_{frame_idx:05d}", video_id=vid_id, frame_index=frame_idx, width=w, height=h
+        # Start Session with Memory Limit Configuration
+        print(f"Initializing SAM3 session (Memory Bank Limit: {max_mem_frames} frames)...")
+        response = video_predictor.handle_request(
+            request=dict(
+                type="start_session", 
+                resource_path=temp_dir, # Triggers the JPEG lazy-loader
+                max_obs_in_memory=max_mem_frames
             )
-            
-        current_img_id = img_ids[frame_idx]
+        )
+        session_id = response["session_id"]
         
-        outputs = response["outputs"]
-        masks = outputs.get("masks", [])
-        obj_ids = outputs.get("object_ids", range(len(masks)))
-        
-        for mask_tensor, obj_id in zip(masks, obj_ids):
-            # Convert PyTorch tensor to numpy
-            mask_np = mask_tensor.cpu().numpy().astype(np.uint8)
-            
-            # Wrap in KWImage Mask object
-            kw_mask = kwimage.Mask(mask_np, 'c_mask')
-            
-            # Convert to compressed COCO RLE format
-            coco_rle = kw_mask.to_coco(style='rle')
-            
-            # Naively generate bounding box from the segmentation mask
-            coco_bbox = kw_mask.to_box().to_coco()
-            
-            # Add annotation to manifest
-            dset.add_annotation(
-                image_id=current_img_id,
-                category_id=cat_id,
-                bbox=coco_bbox,
-                segmentation=coco_rle,
-                track_id=int(obj_id) 
+        # Add prompt to the first frame
+        print(f"Adding text prompt: '{text_prompt}' to frame 0 (conf={conf_threshold}, mask_thresh={mask_threshold})...")
+        video_predictor.handle_request(
+            request=dict(
+                type="add_prompt", 
+                session_id=session_id, 
+                frame_index=0, 
+                text=text_prompt,
+                conf=conf_threshold,
+                mask_threshold=mask_threshold
             )
+        )
+        
+        # 4. Propagate masks and serialize
+        print("Propagating masks natively through the video stream...")
+        for response in video_predictor.handle_stream_request(
+            request=dict(type="propagate_in_video", session_id=session_id)
+        ):
+            frame_idx = response["frame_index"]
+            
+            # Ensure we have a registered virtual image (in case video header count was slightly off)
+            if frame_idx not in img_ids:
+                img_ids[frame_idx] = dset.add_image(
+                    name=f"frame_{frame_idx:05d}", video_id=vid_id, frame_index=frame_idx, width=w, height=h
+                )
+                
+            current_img_id = img_ids[frame_idx]
+            
+            outputs = response["outputs"]
+            masks = outputs.get("masks", [])
+            obj_ids = outputs.get("object_ids", range(len(masks)))
+            
+            for mask_tensor, obj_id in zip(masks, obj_ids):
+                # Convert PyTorch tensor to numpy
+                mask_np = mask_tensor.cpu().numpy().astype(np.uint8)
+                
+                # Wrap in KWImage Mask object
+                kw_mask = kwimage.Mask(mask_np, 'c_mask')
+                
+                # Convert to compressed COCO RLE format
+                coco_rle = kw_mask.to_coco(style='rle')
+                
+                # Naively generate bounding box from the segmentation mask
+                coco_bbox = kw_mask.to_box().to_coco()
+                
+                # Add annotation to manifest
+                dset.add_annotation(
+                    image_id=current_img_id,
+                    category_id=cat_id,
+                    bbox=coco_bbox,
+                    segmentation=coco_rle,
+                    track_id=int(obj_id) 
+                )
             
     # 5. Save the dataset
     print(f"Dumping completed KWCoco dataset to {output_json}...")
