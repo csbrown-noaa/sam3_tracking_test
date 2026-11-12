@@ -62,6 +62,7 @@ def generate_kwcoco_manifest(
         "task": "segment",
         "mode": "predict",
         "model": "/home/user/sam3/checkpoints/sam3.pt",
+        "imgsz": max(w, h), # Dynamically forces native resolution 
     }
     predictor = SAM3VideoSemanticPredictor(overrides=overrides)
     
@@ -106,8 +107,8 @@ def generate_kwcoco_manifest(
                 coco_rle = kw_mask.to_coco(style='rle')
                 
                 # Use the bounding box directly from the Ultralytics tracker
-                # Format is [x_min, y_min, width, height] for COCO
-                x1, y1, x2, y2 = bbox
+                # Format is [x_min, y_min, width, height] for COCO. Ensure they are native floats for JSON.
+                x1, y1, x2, y2 = map(float, bbox)
                 coco_bbox = [x1, y1, x2 - x1, y2 - y1]
                 
                 # Add annotation to manifest
