@@ -4,7 +4,7 @@ import numpy as np
 import cv2
 import kwimage
 import kwcoco
-from ultralytics import SAM # Assuming Ultralytics is installed via `pip install ultralytics`
+from ultralytics.models.sam import SAM3VideoSemanticPredictor
 
 def get_video_metadata(video_path: str) -> tuple[int, int, int]:
     """
@@ -55,23 +55,24 @@ def generate_kwcoco_manifest(
         img_ids[i] = img_id
 
     # 3. Load Ultralytics SAM Engine
-    print("Loading Ultralytics SAM engine...")
-    # NOTE: You may need to change 'sam3.pt' to the specific weights file you are using 
-    # (e.g., 'sam2-b.pt' or 'sam-b.pt') depending on the exact Ultralytics version installed.
-    model = SAM("sam3.pt") 
+    print("Loading Ultralytics SAM3VideoSemanticPredictor engine...")
+    
+    overrides = {
+        "conf": conf_threshold,
+        "task": "segment",
+        "mode": "predict",
+        "model": "/home/user/sam3/checkpoints/sam3.pt",
+    }
+    predictor = SAM3VideoSemanticPredictor(overrides=overrides)
     
     print(f"Propagating masks natively through the video stream (stream=True)...")
     
     # 4. Stream and Track (This loop replaces the Meta predictor)
     # The stream=True argument guarantees frames are processed and discarded one-by-one
-    results = model.track(
+    results = predictor(
         source=video_path,
-        stream=True,
-        conf=conf_threshold,
-        # Note: Depending on the specific Ultralytics version/model, text prompting 
-        # might require a YOLO-World + SAM pipeline. We pass it conceptually here.
-        prompt=text_prompt,
-        tracker="botsort.yaml" # Built-in Ultralytics tracker for consistent ID generation
+        text=[text_prompt],
+        stream=True
     )
     
     for frame_idx, result in enumerate(results):
@@ -84,12 +85,18 @@ def generate_kwcoco_manifest(
             
         current_img_id = img_ids[frame_idx]
         
-        # Check if the model found any objects and assigned tracking IDs in this frame
-        if result.masks is not None and result.boxes.id is not None:
+        # Check if the model found any objects in this frame
+        if result.masks is not None and result.boxes is not None:
             # Extract PyTorch tensors to CPU NumPy arrays
             masks_np = result.masks.data.cpu().numpy().astype(np.uint8)
             boxes_np = result.boxes.xyxy.cpu().numpy()
-            track_ids = result.boxes.id.int().cpu().tolist()
+            
+            # SAM3VideoSemanticPredictor tracks instances natively. 
+            # Fallback to sequential index if the Ultralytics YOLO ID field isn't populated
+            if result.boxes.id is not None:
+                track_ids = result.boxes.id.int().cpu().tolist()
+            else:
+                track_ids = list(range(len(masks_np)))
             
             for mask_arr, bbox, track_id in zip(masks_np, boxes_np, track_ids):
                 # Wrap in KWImage Mask object
