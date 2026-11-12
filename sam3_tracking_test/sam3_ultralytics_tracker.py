@@ -62,7 +62,8 @@ def generate_kwcoco_manifest(
         "task": "segment",
         "mode": "predict",
         "model": "/home/user/sam3/checkpoints/sam3.pt",
-        "imgsz": max(w, h), # Dynamically forces native resolution 
+        "imgsz": max(w, h), # Dynamically forces native resolution,
+        "half": True 
     }
     predictor = SAM3VideoSemanticPredictor(overrides=overrides)
     
