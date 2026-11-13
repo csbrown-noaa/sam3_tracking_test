@@ -80,7 +80,8 @@ def generate_kwcoco_manifest(
     vid_stride: int = 1,
     quantize: int = 16,
     retina_masks: bool = False,
-    iou: float = 0.70
+    iou: float = 0.70,
+    save: bool = False
 ) -> None:
     """
     Runs Ultralytics SAM on a video stream and serializes tracking data to KWCoco.
@@ -96,7 +97,8 @@ def generate_kwcoco_manifest(
         "imgsz": imgsz,
         "vid_stride": vid_stride,
         "retina_masks": retina_masks,
-        "quantize": quantize
+        "quantize": quantize,
+        "save": save
     }
     
     predictor = SAM3VideoSemanticPredictor(overrides=overrides)
@@ -137,6 +139,8 @@ if __name__ == "__main__":
     parser.add_argument("--quantize", type=int, default=16, help="Quantization level. 16 means FP16 half-precision, 8 means INT8, use None/32 for standard FP32.")
     parser.add_argument("--retina-masks", action="store_true", help="Evaluate final mask boundaries at native image resolution.")
     parser.add_argument("--iou", type=float, default=0.70, help="Intersection Over Union (IoU) threshold for object tracking/overlap.")
+    parser.add_argument("--save", action=argparse.BooleanOptionalAction)
+
     
     args = parser.parse_args()
     
@@ -150,5 +154,6 @@ if __name__ == "__main__":
         vid_stride=args.vid_stride,
         quantize=args.quantize,
         retina_masks=args.retina_masks,
-        iou=args.iou
+        iou=args.iou,
+        save=args.save
     )
